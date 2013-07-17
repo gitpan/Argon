@@ -1,0 +1,33 @@
+Changes
+Makefile.PL
+MANIFEST
+README.md
+
+lib/Argon.pm
+lib/Argon/Client.pm
+lib/Argon/Cluster.pm
+lib/Argon/Message.pm
+lib/Argon/Node.pm
+lib/Argon/NodeTracker.pm
+lib/Argon/Queue.pm
+lib/Argon/Process.pm
+lib/Argon/Server.pm
+lib/Argon/Stream.pm
+lib/Argon/Worker.pm
+lib/Argon/Role/Task.pm
+
+
+t/boilerplate.t
+t/manifest.t
+t/pod-coverage.t
+t/pod.t
+
+t/00-load.t
+t/01-Argon.t
+t/02-Argon-Message.t
+t/03-Argon-Process.t
+t/04-Argon-Queue.t
+t/05-Argon-Stream.t
+t/06-Argon-NodeTracker.t
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
