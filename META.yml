@@ -29,4 +29,4 @@ requires:
   String::Escape: 0
   UNIVERSAL::require: 0
   namespace::autoclean: 0
-version: v0.02.1
+version: 0.03
