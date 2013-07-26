@@ -7,7 +7,7 @@
 #-------------------------------------------------------------------------------
 package Argon;
 
-our $VERSION = '0.02';
+our $VERSION = '0.02.1';
 
 use strict;
 use warnings;
