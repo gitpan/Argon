@@ -1,16 +1,15 @@
 ---
-abstract: 'A robust, distributed services platform.'
+abstract: 'A distributed execution platform for Perl'
 author:
   - "\"Jeff Ober\" <\"jeffober@gmail.com\">"
 build_requires:
-  IO::Capture::Stderr: 0
   Test::More: 0
-  Test::Refcount: 0
+  Test::TinyMocker: 0
 configure_requires:
   ExtUtils::MakeMaker: 0
 dynamic_config: 1
-generated_by: 'ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921'
-license: perl
+generated_by: 'ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.132830'
+license: unknown
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html
   version: 1.4
@@ -21,12 +20,11 @@ no_index:
     - inc
 requires:
   AnyEvent: 0
+  Const::Fast: 0
   Coro: 0
-  Coro::PrioChannel: 0.005
+  Coro::ProcessPool: 0
   Data::UUID: 0
+  Guard: 0
   Moose: 0
-  MooseX::StrictConstructor: 0
-  String::Escape: 0
-  UNIVERSAL::require: 0
-  namespace::autoclean: 0
-version: 0.05
+  MooseX::AttributeShortcuts: 0
+version: 0.06

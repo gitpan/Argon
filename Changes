@@ -1,3 +1,11 @@
+0.6     2014-??-??
+    * Major refactor
+    * Unified bin scripts
+    * Fixed import errors for static builds (thanks folio - https://github.com/foilo)
+
+0.5     2013-??-??
+    * Forgot to put this one in
+
 0.4     2013-07-30
     * Fixed invalid import in Argon::Stream
 

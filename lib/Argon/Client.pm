@@ -1,122 +1,167 @@
-#-------------------------------------------------------------------------------
-# Client connection to an Argon::Node or Argon::Cluster.
-#-------------------------------------------------------------------------------
 package Argon::Client;
 
-use strict;
-use warnings;
-use Carp;
-
 use Moose;
-use MooseX::StrictConstructor;
-use namespace::autoclean;
-
-use Argon::Stream;
+use MooseX::AttributeShortcuts;
+use Carp;
+use AnyEvent;
+use AnyEvent::Socket;
+use Coro;
+use Coro::AnyEvent;
+use Coro::Handle;
+use Guard qw(scope_guard);
+use Argon qw(:commands :priorities);
 use Argon::Message;
-use Argon qw/:logging :commands :priorities/;
+use Argon::Stream;
 
-#-------------------------------------------------------------------------------
-# Remote host port
-#-------------------------------------------------------------------------------
-has 'port' => (
-    is       => 'ro',
-    isa      => 'Int',
-    required => 1,
-);
-
-#-------------------------------------------------------------------------------
-# Remote host name
-#-------------------------------------------------------------------------------
-has 'host' => (
+has host => (
     is       => 'ro',
     isa      => 'Str',
     required => 1,
 );
 
-#-------------------------------------------------------------------------------
-# Argon::Stream managing the socket connection to the remote host
-#-------------------------------------------------------------------------------
-has 'stream' => (
-    is       => 'rw',
+has port => (
+    is       => 'ro',
+    isa      => 'Int',
+    required => 1,
+);
+
+has stream => (
+    is       => 'lazy',
     isa      => 'Argon::Stream',
+    init_arg => undef,
+    handles  => [qw(addr)],
+);
+
+sub _build_stream {
+    my $self = shift;
+    return Argon::Stream->connect($self->host, $self->port);
+}
+
+after _build_stream => sub {
+    my $self = shift;
+    $self->read_loop;
+};
+
+has pending => (
+    is       => 'ro',
+    isa      => 'HashRef',
+    init_arg => undef,
+    default  => sub {{}},
+    traits   => ['Hash'],
+    handles  => {
+        set_pending => 'set',
+        get_pending => 'get',
+        has_pending => 'exists',
+        del_pending => 'delete',
+        all_pending => 'keys',
+    }
+);
+
+has inbox => (
+    is       => 'ro',
+    isa      => 'Coro::Channel',
+    init_arg => undef,
+    default  => sub { Coro::Channel->new() },
+);
+
+has read_loop => (
+    is       => 'lazy',
+    isa      => 'Coro',
     init_arg => undef,
 );
 
-#-------------------------------------------------------------------------------
-# Connects the client to the remote host.
-#-------------------------------------------------------------------------------
+sub _build_read_loop {
+    my $self = shift;
+    return async {
+        scope_guard { $self->shutdown };
+
+        while (1) {
+            my $msg = $self->stream->read or last;
+
+            if ($self->has_pending($msg->id)) {
+                $self->get_pending($msg->id)->put($msg);
+            } else {
+                $self->inbox->put($msg);
+            }
+        }
+    };
+}
+
+sub shutdown {
+    my $self = shift;
+
+    $self->stream->close;
+    $self->inbox->shutdown;
+
+    my $error = 'Lost connection to worker while processing request';
+    foreach my $msgid ($self->all_pending) {
+        my $msg = Argon::Message->new(cmd => $CMD_ERROR, id => $msgid, payload => $error);
+        $self->get_pending($msgid)->put($msg);
+    }
+}
+
 sub connect {
-    my $self   = shift;
-    my $stream = Argon::Stream->connect(
-        host => $self->host,
-        port => $self->port,
-    );
-
-    $self->stream($stream);
+    my $self = shift;
+    $self->stream;
 }
 
-#-------------------------------------------------------------------------------
-# Sends a message and waits for the response. If the message is rejected,
-# continues to resend the message after longer and longer delays until it is
-# accepted.
-#-------------------------------------------------------------------------------
-sub _retry {
-    my ($self, $msg, $retries) = @_;
-    my $attempts = 0;
+sub _wait_msgid {
+    my ($self, $msgid) = @_;
+    my $reply = $self->get_pending($msgid)->get();
+    $self->del_pending($msgid);
+    return $reply;
+}
 
-    while (1) {
-        ++$attempts;
+sub send {
+    my ($self, $msg) = @_;
+    $self->set_pending($msg->id, Coro::Channel->new());
+    $self->stream->write($msg);
+    return $self->_wait_msgid($msg->id);
+}
 
-        croak "failed after $retries retries"
-            if defined $retries && $attempts > $retries;
+sub queue {
+    my ($self, $f, $args, $pri) = @_;
+    $f && ref $f eq 'CODE' || croak 'expected CODE ref';
+    $args ||= [];
+    ref $args eq 'ARRAY' || croak 'expected ARRAY ref of args';
+    $pri ||= $PRI_NORMAL;
 
-        my $reply = $self->stream->send($msg);
+    my $reply = $self->send(Argon::Message->new(
+        cmd     => $CMD_QUEUE,
+        pri     => $pri,
+        payload => [$f, $args],
+    ));
 
-        # If the task was rejected, sleep a short (but lengthening) amount of
-        # time before attempting again.
-        if ($reply->command == CMD_REJECTED) {
-            my $sleep_time = log($attempts + 1) / log(10);
-            Coro::AnyEvent::sleep($sleep_time);
-        }
-        else {
-            return $reply;
-        }
+    if ($reply->cmd == $CMD_COMPLETE) {
+        return $reply->payload;
+    } elsif ($reply->cmd == $CMD_ERROR) {
+        croak $reply->payload;
     }
 }
 
-#-------------------------------------------------------------------------------
-# Creates a new task and queues it on the connected network. Throws an error if
-# the remote host is not connected. By default, there is no limit to the number
-# of retries when the system is under load and a task is rejected. This may be
-# controlled using the retries parameter.
-#
-# TODO support parameter "retries"
-#-------------------------------------------------------------------------------
-sub process {
-    my ($self, %param) = @_;
-    my $class    = $param{class}    || croak 'expected class';
-    my $params   = $param{params}   || [];
-    my $priority = $param{priority} || PRI_NORMAL;
-    my $retries  = $param{retries};
+sub defer {
+    my $arr = wantarray;
+    my $cv  = AnyEvent->condvar;
 
-    croak 'not connected' unless $self->stream;
+    my $thread = async_pool {
+        if ($arr) {
+            my @result = eval { queue(@_) };
+            $cv->croak($@) if $@;
+            $cv->send(@result);
+        } else {
+            my $result = eval { queue(@_) };
+            $cv->croak($@) if $@;
+            $cv->send($result);
+        }
+    } @_;
 
-    my $msg = Argon::Message->new(command => CMD_QUEUE);
-    $msg->set_payload([$class, $params]);
-
-    my $reply = $self->_retry($msg, $retries);
-    if ($reply->command == CMD_COMPLETE) {
-        return $reply->get_payload;
-    } else {
-        croak $reply->get_payload;
-    }
+    return sub { $cv->recv };
 }
 
+no Moose;
 __PACKAGE__->meta->make_immutable;
-
 1;
-
-=pod
+__DATA__
 
 =head1 NAME
 
@@ -126,54 +171,99 @@ Argon::Client
 
     use Argon::Client;
 
-    my $client = Argon::Client->new(port => 8000, host => 'some.host.name');
-    $client->connect;
-    my $result = $client->process(
-        class  => 'Some::Class', # with Argon::Role::Task
-        params => [ foo => 'bar', baz => 'bat' ],
-    );
+    # Connect
+    my $client = Argon::Client->new(host => '...', port => XXXX);
+
+    # Send task and wait for result
+    my $the_answer = $client->queue(sub {
+        my ($x, $y) = @_;
+        return $x * $y;
+    }, [6, 7]);
+
+    # Send task and get a deferred result that can be synchronized later
+    my $deferred = $client->defer(sub {
+        my ($x, $y) = @_;
+        return $x * $y;
+    }, [6, 7]);
+
+    my $result = $deferred->();
+
+    # Close the client connection
+    $client->shutdown;
 
 =head1 DESCRIPTION
 
-Argon::Client provides a client connection to an Argon::Node or Argon::Cluster
-instance and a simple API for sending tasks and retrieving the results.
+Establishes a connection to an Argon network and provides methods for executing
+tasks and collecting the results.
 
 =head1 METHODS
 
-=head2 new(port => ..., host => ...)
+=head2 new(host => $host, port => $port)
 
-Creates a new Argon::Client that will connect to I<host:port>. Port must be a
-valid port number and host a valid hostname to which the current system can
-connect.
+Creates a new C<Argon::Client>. The connection is made lazily when the first
+call to L</queue> or L</connect> is performed. The connection can be forced by
+calling L</connect>.
 
-=head2 connect()
+=head2 connect
 
-Creates a connection to the remote host. An error is thrown if the connection
-fails.
+Connects to the remote host.
 
-=head2 process(class => '...', params => [...], priority => PRI_HIGH)
+=head2 queue($f, $args)
 
-Queues a task on the remote host and returns the results. If the task resulted
-in an error, it is rethrown here. Otherwise, the result of calling the I<run>
-method of the class passed as an argument. Params expects an array ref of
-arguments to be passed to I<class>'s constructor (although they may be in the
-form of hash arguments, e.g. C<[foo => 'bar']>).
+Sends a task to the Argon network to evaluate C<$f->(@$args)> and returns the
+result. Since Argon uses L<Coro>, this method does not actually block until the
+result is received. Instead, it yields execution priority to other threads
+until the result is available.
 
-By default, tasks are sent with a priority of C<PRI_NORMAL>. This may be
-controlled via the I<priority> parameter.
+If an error occurs in the execution of C<$f>, an error is thrown.
 
-Due to Argon's architecture, an overloaded system will reject tasks rather than
-create a large backlog. When this happens, Argon::Client silently retries the
-task indefinitely until it is accepted and completed. To control this behavior,
-the optional parameter I<retries> may be specified to limit the number of
-retries.
+=head2 defer($f, $args)
+
+Similar to L</queue>, but instead of waiting for the result, returns an
+anonymous function that, when called, waits and returns the result. If an error
+occurs when calling <$f>, it is re-thrown from the anonymous function.
+
+=head2 shutdown
+
+Disconnects from the Argon network.
+
+=head1 A NOTE ABOUT SCOPE
+
+L<Storable> is used to serialize code that is sent to the Argon network. This
+means that the code sent I<will not have access to variables and modules outside
+of itself> when executed. Therefore, the following I<will not work>:
+
+    my $x = 0;
+    $client->queue(sub { return $x + 1 }); # $x not found!
+
+The right way is to pass it to the function as part of the task's arguments:
+
+    my $x = 0;
+
+    $client->queue(sub {
+        my $x = shift;
+        return $x + 1;
+    }, [$x]);
+
+Similarly, module imports are not available to the function:
+
+    use Data::Dumper;
+
+    my $data = [1,2,3];
+    my $string = $client->queue(sub {
+        my $data = shift;
+        return Dumper($data); # Dumper not found
+    }, [$data]);
+
+The right way is to import the module inside the task:
+
+    my $data = [1,2,3];
+    my $string = $client->queue(sub {
+        use Data::Dumper;
+        my $data = shift;
+        return Dumper($data); # Dumper not found
+    }, [$data]);
 
 =head1 AUTHOR
 
-Jeff Ober L<mailto:jeffober@gmail.com>
-
-=head1 LICENSE
-
-BSD license
-
-=cut
+Jeff Ober <jeffober@gmail.com>

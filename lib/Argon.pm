@@ -1,57 +1,34 @@
-#-------------------------------------------------------------------------------
-# TODO
-#   * Habeus Corpus
-#   * Worker API for other languages/platforms
-#   * Track ping times and report lag between cluster/node
-#     * Adjust cluster's node selection to account for lag time
-#-------------------------------------------------------------------------------
 package Argon;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 use strict;
 use warnings;
-use Carp;
 use namespace::autoclean;
-
+use Carp;
+use AnyEvent::Log;
+use Const::Fast;
 use Coro;
-use Coro::Channel;
-use AnyEvent::Util qw/fh_nonblocking/;
-use POSIX          qw/strftime/;
-use Scalar::Util   qw/weaken/;
+use Scalar::Util qw(weaken);
+use POSIX qw(strftime);
 
 require Exporter;
 use base qw/Exporter/;
 
 our %EXPORT_TAGS = (
-    'priorities' => [qw/
-        PRI_MAX
-        PRI_HIGH
-        PRI_NORMAL
-        PRI_LOW
-        PRI_MIN
-    /],
+    # Priorities
+    priorities => [qw($PRI_HIGH $PRI_NORMAL $PRI_LOW)],
 
     # Command verbs and responses
-    'commands' => [qw/
-        CMD_ACK
-        CMD_QUEUE
-        CMD_REJECTED
-        CMD_COMPLETE
-        CMD_ERROR
-        CMD_ADD_NODE
-        CMD_PING
-    /],
+    commands => [qw(
+        $CMD_PING $CMD_QUEUE $CMD_REGISTER
+        $CMD_ACK $CMD_COMPLETE $CMD_ERROR $CMD_REJECTED
+    )],
 
-    'logging' => [qw/
-        INFO
-        WARN
-        ERROR
-    /],
+    logging => [qw(DEBUG INFO WARN ERROR)],
 );
 
-our @EXPORT_OK = map { @$_ } values %EXPORT_TAGS;
-our @EXPORT    = qw/K/;
+our @EXPORT_OK = ('K', map { @$_ } values %EXPORT_TAGS);
 
 #-------------------------------------------------------------------------------
 # Returns a new function suitable for use as a callback. This is useful to pass
@@ -60,6 +37,7 @@ our @EXPORT    = qw/K/;
 # Inputs:
 #     $fn      : CODE reference or function name
 #     $context : class name or object instance
+#     @args    : other arguments to pass to $fn
 #
 # Output:
 #     CODE reference
@@ -73,66 +51,53 @@ our @EXPORT    = qw/K/;
 #
 #     # Using a class method
 #     my $cb = K('on_connection', 'ClientClass');
+#
+#     # With extra arguments
+#     my $cb = K('on_connection', $client, 'x', 'y', 'z');
 #-------------------------------------------------------------------------------
 sub K {
-    my ($fn, $context) = @_;
+    my ($fn, $context, @args) = @_;
 
     croak "unknown method $fn"
         if !ref $context
         || !$context->can($fn);
 
-    my $callback = sub {
-        $context->can($fn)->($context, @_);
-    };
-
     weaken $context;
-    return $callback;
+    my $k = $context->can($fn);
+
+    return sub {
+        unshift @_, $context, @args;
+        goto $k;
+    };
 }
 
 #-------------------------------------------------------------------------------
 # Defaults
 #-------------------------------------------------------------------------------
-our $LISTEN_QUEUE_SIZE  = 128;      # queue size for listening sockets
-our $TIMEOUT            = 3;        # number of seconds to wait for a read/write op on a socket
-our $CHUNK_SIZE         = 1024 * 4; # number of bytes to read at a time
-our $EOL                = "\n";     # end of line/message character(s)
-our $MESSAGE_SEPARATOR  = ' ';      # separator between parts of a message (command, priority, payload, etc)
-our $TRACK_MESSAGES     = 10;       # number of message times to track for computing avg processing time at a host
-our $POLL_INTERVAL      = 2;        # number of seconds between polls for connectivity between cluster/node
-our $CHAOS_MONKEY       = 0;        # percent chance of causing service to die every 30 seconds (set to zero to disable)
-                                    # See: http://www.codinghorror.com/blog/2011/04/working-with-the-chaos-monkey.html
-
-#-------------------------------------------------------------------------------
-# Debug levels
-#-------------------------------------------------------------------------------
-use constant DEBUG_INFO  => 1 << 0;
-use constant DEBUG_WARN  => 1 << 1;
-use constant DEBUG_ERROR => 1 << 2;
-
-#-------------------------------------------------------------------------------
-# Commands
-#-------------------------------------------------------------------------------
-use constant CMD_ACK      => 0;  # Acknowledgement (respond OK)
-use constant CMD_QUEUE    => 1;  # Queue a message
-use constant CMD_COMPLETE => 2;  # Response - message is complete
-use constant CMD_REJECTED => 3;  # Response - message was rejected
-use constant CMD_ERROR    => 4;  # Response - error processing message or invalid message format
-use constant CMD_ADD_NODE => 5;  # Add a node to a cluster
-use constant CMD_PING     => 6;  # Add a node to a cluster
+our $EOL             = "\n"; # end of line/message character(s)
+our $MSG_SEPARATOR   = ' ';  # separator between parts of a message (command, priority, payload, etc)
+our $TRACK_MESSAGES  = 10;   # number of message times to track for computing avg processing time at a host
+our $POLL_INTERVAL   = 5;    # number of seconds between polls for connectivity between cluster/node
+our $CONNECT_TIMEOUT = 5;    # number of seconds after which a stream times out attempting to connect
 
 #-------------------------------------------------------------------------------
 # Priorities
 #-------------------------------------------------------------------------------
-use constant PRI_MAX    => 0;
-use constant PRI_HIGH   => 1;
-use constant PRI_NORMAL => 2;
-use constant PRI_LOW    => 3;
-use constant PRI_MIN    => 4;
+const our $PRI_HIGH   => Coro::PRIO_HIGH;
+const our $PRI_NORMAL => Coro::PRIO_NORMAL;
+const our $PRI_LOW    => Coro::PRIO_MIN;
 
 #-------------------------------------------------------------------------------
-# DEBUG bitmask
+# Commands
 #-------------------------------------------------------------------------------
-our $DEBUG = DEBUG_INFO | DEBUG_WARN | DEBUG_ERROR;
+const our $CMD_PING     => 0;  # Add a node to a cluster
+const our $CMD_QUEUE    => 1;  # Queue a message
+const our $CMD_REGISTER => 2;  # Add a node to a cluster
+
+const our $CMD_ACK      => 3;  # Acknowledgement (respond OK)
+const our $CMD_COMPLETE => 4;  # Response - message is complete
+const our $CMD_ERROR    => 5;  # Response - error processing message or invalid message format
+const our $CMD_REJECTED => 6;  # Response - no available capacity for handling tasks
 
 #-------------------------------------------------------------------------------
 # Strips an error message of line number and file information.
@@ -146,254 +111,147 @@ sub error {
     return $msg;
 }
 
-#-------------------------------------------------------------------------------
-# Emits a message to STDERR in a consistent fashion. Accepts arguments
-# identically to sprintf. Messages are queued until the output handle is
-# writable.
-#
-# TODO: more configurable
-#-------------------------------------------------------------------------------
-sub LOG ($@) {
-    my ($format, @args) = @_;
+const our $LOG_ERROR => 1;
+const our $LOG_WARN  => 2;
+const our $LOG_INFO  => 4;
+const our $LOG_DEBUG => 8;
 
-    if ($format =~ /(?<!%)%/) {
-        foreach my $arg (@args) {
-            carp 'Use of uninitialized value in LOG'
-                unless defined $arg;
-        }
-    }
+our $LOG_LEVEL = $LOG_ERROR | $LOG_WARN | $LOG_INFO;
 
-    chomp $format;
-    my $msg = error(sprintf($format, @args));
+sub LOG {
+    my $lvl = shift;
+    my $msg = error(sprintf(shift, @_));
+    my $pid = $$;
     my $ts  = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    warn sprintf("[%s] [%d] %s\n", $ts, $$, $msg);
+    warn sprintf("[%s] [% 6d] [%s] %s\n", $ts, $pid, $lvl, $msg);
 }
 
-#-------------------------------------------------------------------------------
-# Logging functions
-#-------------------------------------------------------------------------------
-sub INFO  ($@) { goto \&LOG if $DEBUG & DEBUG_INFO  }
-sub WARN  ($@) { goto \&LOG if $DEBUG & DEBUG_WARN  }
-sub ERROR ($@) { goto \&LOG if $DEBUG & DEBUG_ERROR }
-
-#-------------------------------------------------------------------------------
-# Chaos monkey
-#-------------------------------------------------------------------------------
-sub CHAOS {
-    if ($CHAOS_MONKEY) {
-        srand time;
-        while (1) {
-            Coro::AnyEvent::sleep(30);
-            my $chance = rand 100;
-            if ($chance <= $CHAOS_MONKEY) {
-                ERROR 'The chaos moneky strikes! (rolled %d)', $chance;
-                exit 1;
-            } else {
-                INFO 'Chaos monkey rolled %d', $chance;
-            }
-        }
-    }
-}
+sub DEBUG { LOG('DEBUG', @_) if $LOG_LEVEL & $LOG_DEBUG }
+sub INFO  { LOG('INFO',  @_) if $LOG_LEVEL & $LOG_INFO  }
+sub WARN  { LOG('WARN',  @_) if $LOG_LEVEL & $LOG_WARN  }
+sub ERROR { LOG('ERROR', @_) if $LOG_LEVEL & $LOG_ERROR }
 
 1;
-=pod
+__DATA__
 
 =head1 NAME
 
 Argon
 
-=head1 SYNOPSIS
+=head1 RATIONALE
 
-    # Start a manager on port 8000
-    cluster -p 8000
-    
-    # Start a stand-alone node with 4 workers on port 8000
-    node -w 4 -p 8000
-    
-    # Start a node and attach to a manager
-    node -w 4 -p 8001 -m somehost:8000
+Argon is a distributed processing platform built for Perl. It is built to
+provide a simple system for building radically scalable software while at the
+same time ensuring a high level of robustness and redundancy.
 
-=head1 DESCRIPTION
+=head1 MANAGERS
 
-Argon is a multi-platform distributed task processing system, designed with the
-goal of making the creation of a robust system simple.
+Managers are entry points into the distributed network. They accept tasks from
+clients and route them to workers, then deliver the results back to the client.
 
-=head1 USAGE
+Managers keep track of the nodes available on the network, ensuring that work
+is distributed in a balanced and efficient manner to achieve the highest
+throughput. If a worker becomes unavailable, the load is automatically shifted
+to the rest of the network. If the worker becomes available again, it will be
+picked up and the manager will start shifting load to it as necessary.
 
-Argon systems are build from two pieces: managers and nodes. A manager (or
-cluster) is a process that manages one or more nodes. A node is a process that
-manages a pool of worker processes. A node can be stand-alone (unmanaged) or
-have a single manager. A manager does not need to know about nodes underneath
-it; nodes that are started with the -m parameter register their presence with
-the manager. If the node goes down or becomes unavailable, the manager will
-automatically account for this and route tasks to other nodes.
+Managers are started with C<argon>:
 
-=head2 Stand-alone nodes
+    argon --manager --port 8000 --host mgrhost
 
-A stand-alone node does not register with a manager. It can accept tasks
-directly from clients. Tasks will be assigned or queued to worker processes.
-The number of worker processes is controlled with the -w parameter.
+See L<bin/argon>.
 
-To start a basic node with 4 worker processes, listening on port 8000, use:
+=head1 WORKERS
 
-    node -w 4 -p 8000
+Workers are essentially a managed pool of Perl processes. Managers route tasks
+to workers, who distribute them among their pool of Perl processes, then return
+the results to the manager (who in turn ensures it gets back to the client).
 
-Note that by default, 4 workers are started, so -w isn't truly necessary here.
+Once started, the worker notifies the manager that it is available and can
+immediately start handling tasks as needed. If for any reason the worker loses
+its connection to the manager, it will attempt to reestablish the connection
+until it is again in contact with its manager.
 
-A node must know where to find any code that is used in the tasks it is given.
-This is accomplished with the -i parameter:
+Argon workers are uniform. There are no "channels" for individual types of
+tasks. All workers can handle any type of task. This ensures that no classes of
+task are starved of resources while other types have underutilized workers.
 
-    node -p 8000 -i /path/to/libs -i /path/to/otherlibs
+Workers are started with C<argon>:
 
-As with any long-running process, workers started by the node may end up
-consuming a significant amount of memory. To address this, the node accepts the
--r parameter, which controls the max number of tasks a worker may handle before
-it is restarted to release any memory it is holding. By default, workers may
-handle an indefinite number of tasks.
+    argon --worker --port 8001 --host workerhost --manager somehost:8000
 
-    node -p 8000 -i /path/to/libs -r 250
+By default, a worker will start a number of Perl processes that correlates to
+the number of CPUs on the system. This can be overridden with the C<--workers>
+option.
 
-=head2 Managed nodes
+    argon --worker --port 8001 --host workerhost --manager somehost:8000 --workers 8
 
-A managed node is one that registers itself with a manager/cluster process. The
-manager is added with the -m parameter:
+See L<bin/argon>.
 
-    node -p 8000 -i /path/to/libs -r 250 -m manager:8000
+=head1 CLIENTS
 
-Once started, the node will connect to the server I<manager> on port I<8000>
-and attempt to register. Once registered, the node is immediately available to
-begin handling requests from the manager.
+Clients connect to the manager (or, if desired, directly to a "stand-alone"
+worker that was started without the C<--manager> option). Tasks can be
+launched in two different ways.
 
-Although the node will technically still accept requests directly from clients
-in managed mode, this is bad practice and will cause inaccuracy in the
-manager's routing algorithm.
-
-=head2 Managers
-
-Managers (also called clusters) are servers that route tasks to the most
-available node. This is determined by analyzing the average processing time for
-a given node and comparing it with the number of tasks it is currently
-assigned.
-
-Managers are started very simply:
-
-    cluster -p 8000
-
-Managers do not execute arbitrary code and therefore do not need to know where
-any libraries are stored.
-
-=head2 Queues
-
-Nodes and managers both maintain a bounded queue. As requests come in, they are
-added to the queue. If the queue is full, the task is rejected.
-
-The reason for this is that when the system is under high load this avoids the
-creation of a large backlog of tasks. A large backlog acts like a traffic jam,
-affecting system responsiveness for a much longer period as the backlog is
-cleared before it returns to normal operation.
-
-Instead, rejected tasks are automatically retried by the client using an
-algorithm designed to prevent overloading the system with retry requests. By
-default, the client will retry an unlimited number of times (although this is
-configurable).
-
-The size of the queue is controlled with -l (lower-case L, for limit)
-parameter. This parameter applies to both nodes and managers. By default, it is
-set to 64, although this value may not be optimal for your hardware and worker
-count. A good rule of thumb is to allow 8-16 slots in the queue per worker. For
-a node, this means the number of workers directly managed by the ndoe. For a
-cluster, this means the total number of workers expected to be available to it
-through its registered nodes.
-
-=head2 Clients
-
-The L<Argon::Client> class provides a simple way to converse with an Argon
-system:
+The first method is to send a task and wait for the results. Note that
+Argon uses Coro, so "waiting" for the result means that the current thread
+of execution yields until the result is ready, at which point it is awoken.
 
     use Argon::Client;
 
-    my $client = Argon::Client->new(port => 8000, host => 'some.host.name');
-    $client->connect;
-    my $result = $client->process(
-        class  => 'Some::Class', # with Argon::Role::Task
-        params => [ foo => 'bar', baz => 'bat' ],
+    my $client = Argon::Client->new(host => "mgrhost", port => 8000);
+    my $result = $client->queue(
+        # Code to execute
+        sub {
+            my ($x, $y) = @_;
+            return $x + $y;
+        },
+        # Arguments to pass that code
+        [4, 7],
     );
 
-The only requirement is that all nodes in the system know where C<Some::Class>
-is located. See the -i parameter above to node.
+Tasks can also be sent off to the network in the background, allowing the
+thread of execution to continue until a point where synchronization is
+required.
 
-=head2 Multiplexing clients
-
-L<Argon::Client/process> does not return until the task has been completed.
-However, Argon is implemented using L<Coro>, allowing the process method to
-yield to other threads while it waits for its result. This makes it extremely
-simple to process multiple tasks through multiple clients at the same time.
-
-    use Coro;
     use Argon::Client;
 
-    # Assume a list of tasks, where each element is an array ref of C<[$class,
-    # $params]>.
-    my @tasks;
+    my $client = Argon::Client->new(host => "mgrhost", port => 8000);
 
-    # Create a simple pool of client objects
-    my $clients = Coro::Channel->new();
-    for (1 .. 4) {
-        my $client = Argon::Client->new(port => 8000, host => 'some.host.name');
-        $clients->put($client);
-    }
+    # Ship the task off and get a function that, when called, waits for
+    # the result and returns it.
+    my $deferred = $client->defer(
+        # Code to execute
+        sub {
+            my ($x, $y) = @_;
+            return $x + $y;
+        },
+        # Arguments to pass that code
+        [4, 7],
+    );
 
-    # Loop over the task list
-    my @pending;
-    while (my ($class, $params) = pop @tasks) {
-        # Get the next available client. This blocks until a client is
-        # available from the Coro::Channel ($clients).
-        my $client = $clients->get();
+    # Synchronize to get the result
+    my $result = $deferred->();
 
-        # Send the client the task in a Coro thread, storing the return value
-        # in @pending.
-        push @pending, async {
-            # Send the task
-            my $result = $client->process(
-                class  => $class,
-                params => $params,
-            );
+Errors thrown in the execution of the task are trapped and re-thrown by
+the client when the result is returned. In the case of C<queue> that is done
+when call returns. In the case of C<defer>, it happens when the deferred
+result is synchronized.
 
-            # Release the client back into the pool
-            $clients->put($client);
+See L<Argon::Client>.
 
-            # Do something with result
-            ...
-        };
-    }
+=head1 SCALABILITY
 
-    # Wait on each thread to complete
-    $_->join foreach @pending;
+Argon is designed to make scalability simple and easy. Simply add more workers
+to boost the resources available to all applications utilizing the network.
 
-See bin/bench for a more robust implementation.
-
-=head2 Task design
-
-Tasks must use the L<Argon::Role::Task> class. Tasks will be created by
-instantiating the class with the parameters provided to the
-L<Argon::Client/process> method. Task classes must also have a C<run>
-method which performs the task's work and returns the result.
-
-=head2 CAVEATS
-
-As with all such systems, performance is greatly affected by the size of the
-messages sent. Therefore, it is recommended to keep as much data used by a task
-as possible in a database or other network-accessible storage location. For
-example, design your task such that it accepts an id that can be used to access
-the task data from a database, and have it return an id which can be used to
-access the result.
+Because Argon workers are all uniform, adding a new worker node guarantees a
+linear boost in resources available to all client applications. For example,
+given identical tasks on a network with two worker nodes, each running the same
+number of processes, adding another worker would increase throughput by 50%.
+Doubling the number of workers would increase throughput by 100%.
 
 =head1 AUTHOR
 
-Jeff Ober L<mailto:jeffober@gmail.com>
-
-=head1 LICENSE
-
-BSD license
-
-=cut
+Jeff Ober <jeffober@gmail.com>
