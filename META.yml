@@ -27,4 +27,4 @@ requires:
   Guard: 0
   Moose: 0
   MooseX::AttributeShortcuts: 0
-version: 0.06
+version: v0.06.1
