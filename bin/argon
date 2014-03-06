@@ -1,11 +1,10 @@
-#!/usr/bin/env perl
+#!perl
 
 use strict;
 use warnings;
 use Pod::Usage;
 use Getopt::Long;
 use UNIVERSAL::require;
-use EV;
 use Argon;
 use Argon::Manager;
 use Argon::Worker;
