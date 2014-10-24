@@ -22,5 +22,6 @@ t/03-Argon-Dispatcher.t
 t/04-Argon-Worker.t
 t/05-Argon-Tracker.t
 t/06-Argon-Manager.t
+t/07-integration.t
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)

@@ -4,7 +4,7 @@
       "\"Jeff Ober\" <\"jeffober@gmail.com\">"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.133380",
+   "generated_by" : "ExtUtils::MakeMaker version 7, CPAN::Meta::Converter version 2.120630",
    "license" : [
       "unknown"
    ],
@@ -22,6 +22,7 @@
    "prereqs" : {
       "build" : {
          "requires" : {
+            "List::Util" : "0",
             "Test::More" : "0",
             "Test::TinyMocker" : "0"
          }
@@ -39,12 +40,13 @@
             "Coro::ProcessPool" : "0",
             "Data::UUID" : "0",
             "Guard" : "0",
-            "Moose" : "0",
-            "MooseX::AttributeShortcuts" : "0",
+            "Moo" : "0",
+            "MooX::HandlesVia" : "0",
+            "Types::Standard" : "0",
             "UNIVERSAL::require" : "0"
          }
       }
    },
    "release_status" : "stable",
-   "version" : "0.09"
+   "version" : "0.10"
 }

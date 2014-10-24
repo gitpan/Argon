@@ -1,8 +1,7 @@
 package Argon::Worker;
 
-use Moose;
-use MooseX::AttributeShortcuts;
-use Moose::Util::TypeConstraints;
+use Moo;
+use Types::Standard qw(-types);
 use Carp;
 use Coro;
 use Coro::ProcessPool;
@@ -14,41 +13,40 @@ use Argon qw(K :commands :logging);
 
 extends 'Argon::Dispatcher';
 
-subtype 'Argon::Worker::ManagerAddress'
-    => as      'Str'
-    => where   { /\w+:\d+/ }
-    => message { 'expected manager address in format host:port' };
-
 has manager => (
     is        => 'rwp',
-    isa       => 'Argon::Worker::ManagerAddress',
+    isa       => sub {
+        croak sprintf("'%s' does not match host:port", ($_[0] // 'undef'))
+            if !defined $_[0]
+            || $_[0] !~ /^[\w\.]+:\d+$/;
+    },
     predicate => 'is_managed',
 );
 
 has workers => (
     is  => 'ro',
-    isa => 'Maybe[Int]',
+    isa => Maybe[Int],
 );
 
 has max_requests => (
     is  => 'ro',
-    isa => 'Maybe[Int]',
+    isa => Maybe[Int],
 );
 
 has pool => (
     is  => 'lazy',
-    isa => 'Coro::ProcessPool',
+    isa => InstanceOf['Coro::ProcessPool'],
 );
 
 has key => (
     is      => 'lazy',
-    isa     => 'Str',
+    isa     => Str,
     default => sub { Data::UUID->new->create_str },
 );
 
 has manager_address => (
     is  => 'rwp',
-    isa => 'Str',
+    isa => Str,
 );
 
 sub _build_pool {
@@ -61,24 +59,32 @@ sub _build_pool {
 
 has capacity => (
     is  => 'lazy',
-    isa => 'Int',
+    isa => Int,
 );
 
 sub _build_capacity { $_[0]->pool->{max_procs} }
 
 has is_registered => (
     is       => 'rwp',
-    isa      => 'Bool',
+    isa      => Bool,
     default  => 0,
     init_arg => undef,
 );
 
 has manager_client_addr => (
     is        => 'rwp',
-    isa       => 'Str',
+    isa       => Str,
     init_arg  => undef,
     clearer   => 'clear_manager_client_addr',
 );
+
+# Shut down the process pool when the server stops
+around stop => sub {
+    my $orig = shift;
+    my $self = shift;
+    $self->pool->shutdown;
+    $self->$orig(@_);
+};
 
 sub init {
     my $self = shift;
@@ -141,6 +147,7 @@ sub register {
         );
 
         $stream->write($msg);
+
         # Manager will connect as a client here before returning a reply
         my $reply = $stream->read;
 
@@ -204,6 +211,4 @@ sub cmd_queue {
               : $msg->reply(cmd => $CMD_COMPLETE, payload => $result);
 }
 
-no Moose;
-__PACKAGE__->meta->make_immutable;
 1;
