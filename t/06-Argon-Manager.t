@@ -1,5 +1,6 @@
 use strict;
 use warnings;
+use AnyEvent::Loop; # Ensure the pure perl loop is loaded for testing
 use Test::More;
 use Test::TinyMocker;
 use Guard;

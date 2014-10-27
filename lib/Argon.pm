@@ -1,10 +1,9 @@
 package Argon;
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 
 use strict;
 use warnings;
-use namespace::autoclean;
 use Carp;
 use AnyEvent::Log;
 use Const::Fast;
