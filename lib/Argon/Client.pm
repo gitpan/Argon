@@ -9,8 +9,9 @@ use AnyEvent::Socket;
 use Coro;
 use Coro::AnyEvent;
 use Coro::Handle;
+use List::Util qw(max);
 use Guard qw(scope_guard);
-use Argon qw(:commands :priorities);
+use Argon qw(:commands :priorities :logging);
 use Argon::Message;
 use Argon::Stream;
 
@@ -30,7 +31,9 @@ has stream => (
     is       => 'lazy',
     isa      => InstanceOf['Argon::Stream'],
     init_arg => undef,
-    handles  => [qw(addr)],
+    handles  => {
+        addr => 'addr',
+    },
 );
 
 sub _build_stream {
@@ -73,6 +76,7 @@ has read_loop => (
 
 sub _build_read_loop {
     my $self = shift;
+
     return async {
         scope_guard { $self->shutdown };
 
@@ -121,23 +125,60 @@ sub send {
 }
 
 sub queue {
-    my ($self, $f, $args, $pri) = @_;
+    my ($self, $f, $args, $pri, $max_tries) = @_;
     $f && ref $f eq 'CODE' || croak 'expected CODE ref';
+
     $args ||= [];
     ref $args eq 'ARRAY' || croak 'expected ARRAY ref of args';
-    $pri ||= $PRI_NORMAL;
 
-    my $reply = $self->send(Argon::Message->new(
+    $pri       ||= $PRI_NORMAL;
+    $max_tries ||= 10;
+
+    my $msg = Argon::Message->new(
         cmd     => $CMD_QUEUE,
         pri     => $pri,
         payload => [$f, $args],
-    ));
+    );
+
+    my $next_try = 0.1;
+    my $reply;
+
+    for (my $tries = 1; $tries <= $max_tries; ++$tries) {
+        $reply = $self->send($msg);
+
+        if ($reply->cmd == $CMD_REJECTED) {
+            $next_try = log(max($tries, 1.1)) / log(10);
+            Coro::AnyEvent::sleep $next_try;
+            next;
+        }
+        elsif ($reply->cmd == $CMD_ACK) {
+            return $reply->id;
+        }
+        else {
+            croak sprintf('Unknown response type: %s', $reply->cmd);
+        }
+    }
+
+    croak sprintf('Request failed after %d attempts. %s', $max_tries, $reply->payload);
+}
+
+sub collect {
+    my ($self, $id) = @_;
+    my $msg   = Argon::Message->new(id => $id, cmd => $CMD_COLLECT, payload => $id);
+    my $reply = $self->send($msg);
 
     if ($reply->cmd == $CMD_COMPLETE) {
         return $reply->payload;
-    } elsif ($reply->cmd == $CMD_ERROR) {
+    } else {
         croak $reply->payload;
     }
+}
+
+sub process {
+    my ($self, $f, $args, $pri, $max_tries) = @_;
+    my $id     = $self->queue($f, $args, $pri, $max_tries);
+    my $result = $self->collect($id);
+    return $result;
 }
 
 sub defer {
@@ -146,17 +187,32 @@ sub defer {
 
     my $thread = async_pool {
         if ($arr) {
-            my @result = eval { queue(@_) };
+            my @result = eval { process(@_) };
             $cv->croak($@) if $@;
             $cv->send(@result);
         } else {
-            my $result = eval { queue(@_) };
+            my $result = eval { process(@_) };
             $cv->croak($@) if $@;
             $cv->send($result);
         }
     } @_;
 
     return sub { $cv->recv };
+}
+
+sub server_status {
+    my $self  = shift;
+    my $msg   = Argon::Message->new(cmd => $CMD_STATUS);
+    my $reply = $self->send($msg);
+
+    if ($reply->cmd == $CMD_COMPLETE) {
+        return $reply->payload;
+    } elsif ($reply->cmd == $CMD_ERROR) {
+        croak $reply->payload;
+    } else {
+        DEBUG 'Invalid server response [%d]: %s', $reply->cmd, $reply->payload;
+        croak 'Invalid server response';
+    }
 }
 
 1;
@@ -207,18 +263,58 @@ calling L</connect>.
 
 Connects to the remote host.
 
-=head2 queue($f, $args)
+=head2 server_status
 
-Sends a task to the Argon network to evaluate C<$f->(@$args)> and returns the
-result. Since Argon uses L<Coro>, this method does not actually block until the
-result is received. Instead, it yields execution priority to other threads
-until the result is available.
+Returns a hash of status information about the manager's load, capacity, and
+workers.
 
-If an error occurs in the execution of C<$f>, an error is thrown.
+=head2 queue($f, $args, $pri, $max_tries)
+
+Queues a task with the L<Argon::Manager> and returns a message id which can
+be used to collect the results at a later time. The results are stored for
+at least C<$Argon::DEL_COMPLETE_AFTER> seconds.
+
+=over
+
+=item $f <code ref>
+
+Subroutine to execute.
+
+=item $args <array ref>
+
+Arguments to pass to C<$f>.
+
+=item $pri <int|undef - $Argon::PRI_(LOW|NORMAL|HIGH) constant>
+
+Task priority. Affects how the task is queued with the Manager when load is
+high enough that tasks are not immediately serviced. Defaults to
+C<$Argon::PRI_NORMAL>.
+
+=item $max_tries <int|undef>
+
+When Manager's queue is full, new tasks are rejected until the queue is
+reduced.  Tasks will be retried up to 10 times (by default) until they are
+accepted by the manager. If the task has not been accepted after C<$max_tries>,
+an error is thrown.
+
+=back
+
+=head2 collect($msgid)
+
+Blocks the thread until the result identified by C<$msgid> is available and
+returns the result. If processing the task resulted in an error, the error is
+rethrown when C<collect> is called.
+
+=head2 process($f, $args, $pri, $max_tries)
+
+Equivalent to calling:
+
+    my $msg = $client->queue($f, $args, $pri, $max_tries);
+    my $result = $client->collect($msg);
 
 =head2 defer($f, $args)
 
-Similar to L</queue>, but instead of waiting for the result, returns an
+Similar to L</process>, but instead of waiting for the result, returns an
 anonymous function that, when called, waits and returns the result. If an error
 occurs when calling <$f>, it is re-thrown from the anonymous function.
 
@@ -258,10 +354,15 @@ The right way is to import the module inside the task:
 
     my $data = [1,2,3];
     my $string = $client->queue(sub {
-        use Data::Dumper;
+        require Data::Dumper;
         my $data = shift;
-        return Dumper($data);
+        return Data::Dumper::Dumper($data);
     }, [$data]);
+
+Note the use of C<require> instead of C<use>. This is because C<use> is
+performed at compilation time, causing it to be triggered when the calling code
+is compiled, rather than from within the worker process. C<require>, on the
+other hand, is triggered at runtime and will behave as expected.
 
 =head1 AUTHOR
 

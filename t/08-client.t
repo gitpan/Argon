@@ -7,9 +7,17 @@ use AnyEvent;
 use Coro;
 use Coro::AnyEvent;
 
+use Argon qw(:logging);
 use Argon::Client;
 use Argon::Manager;
 use Argon::Worker;
+
+SET_LOG_LEVEL($FATAL);
+
+sub test {
+    my $n = shift || 0;
+    return $n * $n;
+}
 
 my $manager_cv     = AnyEvent->condvar;;
 my $manager        = Argon::Manager->new();
@@ -32,12 +40,31 @@ Coro::AnyEvent::sleep(3);
 my $client = Argon::Client->new(host => $manager->host, port => $manager->port);
 $client->connect;
 
-my @range    = 1 .. 100;
-my %deferred = map { $_ => $client->defer(sub { $_[0] * 2 }, [$_]) } @range;
-my %results  = map { $_ => $deferred{$_}->() } keys %deferred;
+# Server status
+my $status   = $client->server_status;
+my $expected = {
+    workers          => 1,
+    total_capacity   => $worker->workers,
+    current_capacity => $worker->workers,
+    queue_length     => 0,
+    pending          => {$worker->key => []},
+};
 
+is_deeply($status, $expected, 'expected server status');
+
+my @range = 1 .. 20;
+
+# Test process
+foreach my $i (@range) {
+    my $result = $client->process(\&test, [$i]);
+    is($result, ($i * $i), "process result $i");
+}
+
+# Test defer
+my %deferred = map { $_ => $client->defer(sub { $_[0] * $_[0] }, [$_]) } @range;
+my %results  = map { $_ => $deferred{$_}->() } keys %deferred;
 foreach my $i (shuffle @range) {
-    is($results{$i}, $i * 2, "expected results for $i");
+    is($results{$i}, $i * $i, "defer result $i");
 }
 
 $client->shutdown;

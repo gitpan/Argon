@@ -1,3 +1,11 @@
+0.12    2014-10-29
+    * Added priority queueing to Managers
+    * Added retry to Client when system at max capacity
+    * Manager now deletes uncollected results after $Argon::DEL_COMPLETE_AFTER seconds
+    * Added Manager status report (CMD_STATUS)
+    * Switched from Test::TinyMocker to Sub::Override
+    * Logging now handled with Log::Log4perl
+
 0.11    2014-10-27
     * Tests now force use of AnyEvent::Loop (pure perl loop) for consistency
     * Force version 0.11 of Coro::ProcessPool, which fixes recursive Coro::Handle read bug

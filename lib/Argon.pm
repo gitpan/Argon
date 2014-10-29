@@ -1,15 +1,15 @@
 package Argon;
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 use strict;
 use warnings;
 use Carp;
-use AnyEvent::Log;
 use Const::Fast;
 use Coro;
 use Scalar::Util qw(weaken);
 use POSIX qw(strftime);
+use Log::Log4perl qw();
 
 require Exporter;
 use base qw/Exporter/;
@@ -20,11 +20,19 @@ our %EXPORT_TAGS = (
 
     # Command verbs and responses
     commands => [qw(
-        $CMD_PING $CMD_QUEUE $CMD_REGISTER
+        $CMD_PING $CMD_QUEUE $CMD_COLLECT $CMD_REGISTER $CMD_STATUS
         $CMD_ACK $CMD_COMPLETE $CMD_ERROR $CMD_REJECTED
     )],
 
-    logging => [qw(DEBUG INFO WARN ERROR)],
+    logging => [qw(
+        SET_LOG_LEVEL
+        $TRACE TRACE
+        $DEBUG DEBUG
+        $INFO  INFO
+        $WARN  WARN
+        $ERROR ERROR
+        $FATAL FATAL
+    )],
 );
 
 our @EXPORT_OK = ('K', map { @$_ } values %EXPORT_TAGS);
@@ -73,11 +81,12 @@ sub K {
 #-------------------------------------------------------------------------------
 # Defaults
 #-------------------------------------------------------------------------------
-our $EOL             = "\n"; # end of line/message character(s)
-our $MSG_SEPARATOR   = ' ';  # separator between parts of a message (command, priority, payload, etc)
-our $TRACK_MESSAGES  = 10;   # number of message times to track for computing avg processing time at a host
-our $POLL_INTERVAL   = 5;    # number of seconds between polls for connectivity between cluster/node
-our $CONNECT_TIMEOUT = 5;    # number of seconds after which a stream times out attempting to connect
+our $EOL                = "\n";    # end of line/message character(s)
+our $MSG_SEPARATOR      = ' ';     # separator between parts of a message (command, priority, payload, etc)
+our $TRACK_MESSAGES     = 10;      # number of message times to track for computing avg processing time at a host
+our $POLL_INTERVAL      = 5;       # number of seconds between polls for connectivity between cluster/node
+our $CONNECT_TIMEOUT    = 5;       # number of seconds after which a stream times out attempting to connect
+our $DEL_COMPLETE_AFTER = 30 * 60; # number of seconds after which a completed task's result is delete if not collected
 
 #-------------------------------------------------------------------------------
 # Priorities
@@ -89,18 +98,34 @@ const our $PRI_LOW    => Coro::PRIO_MIN;
 #-------------------------------------------------------------------------------
 # Commands
 #-------------------------------------------------------------------------------
-const our $CMD_PING     => 0;  # Add a node to a cluster
-const our $CMD_QUEUE    => 1;  # Queue a message
-const our $CMD_REGISTER => 2;  # Add a node to a cluster
+const our $CMD_PING     => 0; # Verify that a worker is responding
+const our $CMD_QUEUE    => 1; # Queue a message
+const our $CMD_COLLECT  => 2; # Collect results
+const our $CMD_REGISTER => 3; # Add a node to a cluster
+const our $CMD_STATUS   => 4; # Get process and system status from a manager
 
-const our $CMD_ACK      => 3;  # Acknowledgement (respond OK)
-const our $CMD_COMPLETE => 4;  # Response - message is complete
-const our $CMD_ERROR    => 5;  # Response - error processing message or invalid message format
-const our $CMD_REJECTED => 6;  # Response - no available capacity for handling tasks
+const our $CMD_ACK      => 5; # Acknowledgement (respond OK)
+const our $CMD_COMPLETE => 6; # Response - message is complete
+const our $CMD_ERROR    => 7; # Response - error processing message or invalid message format
+const our $CMD_REJECTED => 8; # Response - no available capacity for handling tasks
 
 #-------------------------------------------------------------------------------
+# Logging
+#-------------------------------------------------------------------------------
+const our $TRACE => $Log::Log4perl::TRACE;
+const our $DEBUG => $Log::Log4perl::DEBUG;
+const our $INFO  => $Log::Log4perl::INFO;
+const our $WARN  => $Log::Log4perl::WARN;
+const our $ERROR => $Log::Log4perl::ERROR;
+const our $FATAL => $Log::Log4perl::FATAL;
+
+my $LOGGER = Log::Log4perl->get_logger('argon');
+
+sub SET_LOG_LEVEL {
+    Log::Log4perl->easy_init($_[0]);
+}
+
 # Strips an error message of line number and file information.
-#-------------------------------------------------------------------------------
 sub error {
     my $msg = shift;
     $msg =~ s/ at (.+?) line \d+.//gsm;
@@ -110,24 +135,20 @@ sub error {
     return $msg;
 }
 
-const our $LOG_ERROR => 1;
-const our $LOG_WARN  => 2;
-const our $LOG_INFO  => 4;
-const our $LOG_DEBUG => 8;
-
-our $LOG_LEVEL = $LOG_ERROR | $LOG_WARN | $LOG_INFO;
-
 sub LOG {
-    my $lvl = shift;
-    my $msg = error(sprintf(shift, @_));
-    my $pid = $$;
-    my $ts  = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    warn sprintf("[%s] [% 6d] [%s] %s\n", $ts, $pid, $lvl, $msg);
+    my $lvl = lc shift;
+    my $msg = sprintf('[%s] => %s', $$, error(sprintf(shift, @_)));
+    $LOGGER->$lvl($msg);
 }
 
-sub DEBUG { LOG('DEBUG', @_) if $LOG_LEVEL & $LOG_DEBUG }
-sub INFO  { LOG('INFO',  @_) if $LOG_LEVEL & $LOG_INFO  }
-sub WARN  { LOG('WARN',  @_) if $LOG_LEVEL & $LOG_WARN  }
-sub ERROR { LOG('ERROR', @_) if $LOG_LEVEL & $LOG_ERROR }
+sub TRACE { LOG(trace => @_) }
+sub DEBUG { LOG(debug => @_) }
+sub INFO  { LOG(info  => @_) }
+sub WARN  { LOG(warn  => @_) }
+sub ERROR { LOG(error => @_) }
+sub FATAL { LOG(fatal => @_) }
+
+SET_LOG_LEVEL $ERROR
+    unless Log::Log4perl->initialized;
 
 1;

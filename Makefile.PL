@@ -20,8 +20,10 @@ WriteMakefile(
         'Const::Fast'        => 0,
         'Coro'               => 0,
         'Coro::ProcessPool'  => '0.11',
+        'Coro::PrioChannel'  => '0.005',
         'Guard'              => 0,
         'Data::UUID'         => 0,
+        'Log::Log4perl'      => 0,
         'UNIVERSAL::require' => 0,
         'Moo'                => 0,
         'MooX::HandlesVia'   => 0,
@@ -31,5 +33,6 @@ WriteMakefile(
         'List::Util'       => 0,
         'Test::More'       => 0,
         'Test::TinyMocker' => 0,
+        'Sub::Override'    => 0,
     },
 );

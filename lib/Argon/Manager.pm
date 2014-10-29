@@ -3,14 +3,50 @@ package Argon::Manager;
 use Moo;
 use MooX::HandlesVia;
 use Types::Standard qw(-types);
+use Const::Fast;
 use Coro;
+use Coro::AnyEvent;
+use Coro::PrioChannel;
 use Coro::Semaphore;
 use Guard qw(scope_guard);
 use Argon::Client;
 use Argon::Tracker;
+use Argon::MessageTracker;
 use Argon qw(K :logging :commands);
 
+const our $ERR_NO_CAPACITY => 'Unable to process request. System is at max capacity.';
+const our $ERR_PROC_FAIL   => 'An error occurred routing the request.';
+const our $ERR_NOT_FOUND   => 'The message ID was not found.';
+
 extends 'Argon::Dispatcher';
+
+has queue_size => (
+    is  => 'ro',
+    isa => Maybe[Int],
+);
+
+has queue => (
+    is       => 'lazy',
+    isa      => InstanceOf['Coro::PrioChannel'],
+    init_arg => undef,
+    handles  => {
+      queue_put => 'put',
+      queue_get => 'get',
+      queue_len => 'size',
+    }
+);
+
+sub _build_queue {
+    my $self = shift;
+    return Coro::PrioChannel->new($self->queue_size);
+}
+
+has msg_tracker => (
+    is       => 'ro',
+    isa      => InstanceOf['Argon::MessageTracker'],
+    init_arg => undef,
+    default  => sub { Argon::MessageTracker->new() },
+);
 
 has workers => (
     is          => 'ro',
@@ -24,6 +60,7 @@ has workers => (
         del_worker  => 'delete',
         has_worker  => 'exists',
         all_workers => 'keys',
+        num_workers => 'count',
     }
 );
 
@@ -57,6 +94,23 @@ has capacity => (
     default  => 0,
 );
 
+has watcher => (
+    is       => 'lazy',
+    isa      => InstanceOf['Coro'],
+    init_arg => undef,
+);
+
+sub _build_watcher {
+    my $self = shift;
+    return async { $self->process_pending while $self->is_running };
+}
+
+has is_running => (
+    is      => 'rw',
+    isa     => Bool,
+    default => 0,
+);
+
 sub inc_capacity {
     my ($self, $amount) = @_;
     $amount //= 1;
@@ -69,11 +123,31 @@ sub dec_capacity {
     $self->{capacity} -= $amount;
 }
 
+sub has_capacity {
+    my $self = shift;
+    return if $self->capacity == 0;
+    return if $self->queue_size && $self->queue_len >= $self->queue_size;
+    return 1;
+}
+
 sub init {
     my $self = shift;
+    $self->is_running(1);
+
+    # Register handlers
     $self->respond_to($CMD_REGISTER, K('cmd_register', $self));
     $self->respond_to($CMD_QUEUE,    K('cmd_queue',    $self));
+    $self->respond_to($CMD_COLLECT,  K('cmd_collect',  $self));
+    $self->respond_to($CMD_STATUS,   K('cmd_status',   $self));
+
+    # Start services
+    $self->watcher;
 }
+
+before shutdown => sub {
+    my $self = shift;
+    $self->is_running(0);
+};
 
 sub deregister {
     my ($self, $worker) = @_;
@@ -96,6 +170,7 @@ sub start_monitor {
         scope_guard { $self->deregister($worker) };
 
         while (1) {
+            DEBUG 'Sending ping';
             my $msg = Argon::Message->new(cmd => $CMD_PING);
             my $reply = $client->send($msg) or last;
 
@@ -107,6 +182,53 @@ sub start_monitor {
             }
         }
     };
+}
+
+sub process_pending {
+    my $self = shift;
+
+    # Get the next message
+    my $msg = $self->queue_get;
+
+    # Acquire capacity slot
+    $self->sem_capacity->down;
+
+    # Release capacity slot once complete
+    scope_guard { $self->sem_capacity->up };
+
+    # Get the next available worker
+    my $cmp = sub { $self->get_tracking($_[0])->est_proc_time };
+    my @workers =
+        sort { $cmp->($a) <=> $cmp->($b) }
+        grep { $self->get_tracking($_)->capacity > 0 }
+        $self->all_workers;
+
+    my $worker = $workers[0];
+
+    # Execute with tracking
+    $self->get_tracking($worker)->start_request($msg->id);
+
+    scope_guard {
+        # If the worker connection was lost while the request was
+        # outstanding, the tracker may be missing, so completing
+        # the request must account for this appropriately.
+        $self->get_tracking($worker)->end_request($msg->id)
+            if $self->has_worker($worker);
+    };
+
+    # Assign the task
+    $msg->{key} = $worker;
+
+    # queue this is hanging sometimes and causing delays in responses
+    my $reply = eval { $self->get_worker($worker)->send($msg) };
+
+    if ($@) {
+        WARN 'Worker error (%s) - disconnecting: %s', $worker, $@;
+        $self->deregister($worker);
+        $reply = $msg->reply(cmd => $CMD_ERROR, payload => "$ERR_PROC_FAIL. Error message: $@");
+    }
+
+    $self->msg_tracker->complete_message($reply);
 }
 
 sub cmd_register {
@@ -151,49 +273,46 @@ sub cmd_register {
 sub cmd_queue {
     my ($self, $msg, $addr) = @_;
 
-    # Return an error if there are no workers registered
-    return $msg->reply(cmd => $CMD_ERROR, payload => 'No workers registered.')
-        if $self->capacity == 0;
+    # Reject tasks when there is no available capacity
+    return $msg->reply(cmd => $CMD_REJECTED, payload => $ERR_NO_CAPACITY)
+        unless $self->has_capacity;
 
-    # Acquire capacity slot
-    $self->sem_capacity->down;
+    $self->msg_tracker->track_message($msg->id);
+    $self->queue_put($msg);
 
-    # Release capacity slot once complete
-    scope_guard { $self->sem_capacity->up };
+    return $msg->reply(cmd => $CMD_ACK);
+}
 
-    # Get the next available worker
-    my $cmp = sub { $self->get_tracking($_[0])->est_proc_time };
-    my @workers =
-        sort { $cmp->($a) <=> $cmp->($b) }
-        grep { $self->get_tracking($_)->capacity > 0 }
-        $self->all_workers;
+sub cmd_collect {
+    my ($self, $msg, $addr) = @_;
 
-    my $worker = $workers[0];
+    my $msgid = $msg->payload;
 
-    # Execute with tracking
-    $self->get_tracking($worker)->start_request($msg->id);
+    return $msg->reply(cmd => $CMD_ERROR, payload => $ERR_NOT_FOUND)
+        unless $self->msg_tracker->is_tracked($msgid);
 
-    scope_guard {
-        # If the worker connection was lost while the request was
-        # outstanding, the tracker may be missing, so completing
-        # the request must account for this appropriately.
-        $self->get_tracking($worker)->end_request($msg->id)
-            if $self->has_worker($worker);
-    };
+    my $result = $self->msg_tracker->collect_message($msgid);
+    return $result->reply(id => $msgid);
+}
 
-    # Assign the task
-    $msg->{key} = $worker;
+sub cmd_status {
+    my ($self, $msg, $addr) = @_;
 
-    # TODO this is hanging sometimes and causing delays in responses
-    my $reply = eval { $self->get_worker($worker)->send($msg) };
-
-    if ($@) {
-        WARN 'Worker error (%s) - disconnecting: %s', $worker, $@;
-        $self->deregister($worker);
-        return $msg->reply(cmd => $CMD_ERROR, payload => "An error occurred routing the request: $@");
-    } else {
-        return $reply;
+    my $pending;
+    foreach my $worker ($self->all_workers) {
+        $pending->{$worker} = [$self->get_tracking($worker)->all_pending];
     }
+
+    return $msg->reply(
+        cmd     => $CMD_COMPLETE,
+        payload => {
+            workers          => $self->num_workers,
+            total_capacity   => $self->capacity,
+            current_capacity => $self->current_capacity,
+            queue_length     => $self->queue_len,
+            pending          => $pending,
+        }
+    );
 }
 
 1;
