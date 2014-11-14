@@ -261,11 +261,20 @@ Queues a task with the L<Argon::Manager> and returns a message id which can
 be used to collect the results at a later time. The results are stored for
 at least C<$Argon::DEL_COMPLETE_AFTER> seconds.
 
+Similarly, a class implementing 'new' and 'run' methods may be used in place
+of a CODE ref:
+
+    my $msgid = $client->queue('Task::Whatever', $args);
+    # Executes Task::Whatever->new(@$args)->run();
+
+This avoids import and closure issues that can occur when passing in a CODE
+reference.
+
 =over
 
-=item $f <code ref>
+=item $f <code ref|string>
 
-Subroutine to execute.
+Subroutine to execute or a task class implementing C<new(@$args)> and C<run>.
 
 =item $args <array ref>
 
@@ -304,6 +313,8 @@ Equivalent to calling:
 Similar to L</process>, but instead of waiting for the result, returns an
 anonymous function that, when called, waits and returns the result. If an error
 occurs when calling <$f>, it is re-thrown from the anonymous function.
+
+C<defer> accepts a either a CODE ref or a task class.
 
 =head2 shutdown
 
@@ -350,6 +361,10 @@ Note the use of C<require> instead of C<use>. This is because C<use> is
 performed at compilation time, causing it to be triggered when the calling code
 is compiled, rather than from within the worker process. C<require>, on the
 other hand, is triggered at runtime and will behave as expected.
+
+Using a task class avoids this issue entirely; the task is loaded within the
+Argon worker process at run time, including any C<use> or C<require>
+statements.
 
 =head1 AUTHOR
 

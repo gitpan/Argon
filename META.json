@@ -39,17 +39,17 @@
             "Const::Fast" : "0",
             "Coro" : "0",
             "Coro::PrioChannel" : "0.005",
-            "Coro::ProcessPool" : "0.14",
+            "Coro::ProcessPool" : "0.15",
             "Data::UUID" : "0",
             "Guard" : "0",
             "Log::Log4perl" : "0",
+            "Module::Load" : "0",
             "Moo" : "0",
             "MooX::HandlesVia" : "0",
-            "Types::Standard" : "0",
-            "UNIVERSAL::require" : "0"
+            "Types::Standard" : "0"
          }
       }
    },
-   "release_status" : "stable",
-   "version" : "0.15"
+   "release_status" : "testing",
+   "version" : "0.15_01"
 }
