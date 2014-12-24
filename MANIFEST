@@ -27,5 +27,6 @@ t/06-worker.t
 t/07-manager.t
 t/08-client.t
 t/09-simple.t
+t/TestTask.pm
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)
