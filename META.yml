@@ -33,4 +33,4 @@ requires:
   Moo: '0'
   MooX::HandlesVia: '0'
   Types::Standard: '0'
-version: 0.15_01
+version: 0.15_02
