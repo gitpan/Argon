@@ -39,7 +39,7 @@
             "Const::Fast" : "0",
             "Coro" : "0",
             "Coro::PrioChannel" : "0.005",
-            "Coro::ProcessPool" : "0.15",
+            "Coro::ProcessPool" : "0.16",
             "Data::UUID" : "0",
             "Guard" : "0",
             "Log::Log4perl" : "0",
@@ -50,6 +50,6 @@
          }
       }
    },
-   "release_status" : "testing",
-   "version" : "0.15_03"
+   "release_status" : "stable",
+   "version" : "0.16"
 }
